@@ -4,6 +4,8 @@ import com.booking.inventory.entity.Event;
 import com.booking.inventory.entity.Seat;
 import com.booking.inventory.repository.EventRepository;
 import com.booking.inventory.repository.SeatRepository;
+import io.swagger.v3.oas.annotations.Operation;
+import io.swagger.v3.oas.annotations.tags.Tag;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
@@ -14,6 +16,7 @@ import java.util.List;
 @RestController
 @RequestMapping("/api/inventory")
 @RequiredArgsConstructor
+@Tag(name = "Inventory", description = "Seed events/seats and check live seat availability")
 public class InventoryController {
 
     private final EventRepository eventRepository;
@@ -21,6 +24,7 @@ public class InventoryController {
 
     public record CreateEventRequest(String name, String venue, int numberOfSeats) {}
 
+    @Operation(summary = "Create an event with N seats (S1, S2, ... SN), all starting AVAILABLE")
     @PostMapping("/events")
     public ResponseEntity<Event> createEvent(@RequestBody CreateEventRequest request) {
         Event event = Event.builder()
@@ -42,6 +46,7 @@ public class InventoryController {
         return ResponseEntity.ok(event);
     }
 
+    @Operation(summary = "List all seats for an event with their live status (AVAILABLE / LOCKED / BOOKED)")
     @GetMapping("/events/{eventId}/seats")
     public ResponseEntity<List<Seat>> getSeats(@PathVariable Long eventId) {
         return ResponseEntity.ok(seatRepository.findByEventId(eventId));

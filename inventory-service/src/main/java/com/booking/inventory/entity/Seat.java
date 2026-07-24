@@ -1,5 +1,6 @@
 package com.booking.inventory.entity;
 
+import com.fasterxml.jackson.annotation.JsonIgnore;
 import jakarta.persistence.*;
 import lombok.*;
 
@@ -16,6 +17,12 @@ public class Seat {
     @GeneratedValue(strategy = GenerationType.IDENTITY)
     private Long id;
 
+    // @JsonIgnore stops Jackson from serializing this field back into JSON.
+    // Without it: Seat -> event -> event.seats -> each seat -> seat.event -> ...
+    // forever, since Event and Seat reference each other (a bidirectional
+    // relationship). We only need the event's ID on the Seat side in practice,
+    // so it's safe - and necessary - to break the cycle here.
+    @JsonIgnore
     @ManyToOne(fetch = FetchType.LAZY)
     @JoinColumn(name = "event_id", nullable = false)
     private Event event;
