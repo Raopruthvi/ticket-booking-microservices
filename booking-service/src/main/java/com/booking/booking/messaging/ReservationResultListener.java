@@ -33,7 +33,7 @@ public class ReservationResultListener {
         // Idempotency note: if this booking is already CONFIRMED/FAILED
         // (e.g. this message was redelivered), don't process it twice or
         // re-publish a duplicate notification.
-        if (booking.getStatus() != Booking.BookingStatus.PENDING) {
+       if (booking.getStatus() != Booking.BookingStatus.PENDING) {
             log.info("Booking {} already in terminal state {} - skipping", booking.getId(), booking.getStatus());
             return;
         }
