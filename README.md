@@ -1,12 +1,14 @@
 # Distributed Ticket Booking System
 
+![CI](https://github.com/Raopruthvi/ticket-booking-microservices/actions/workflows/ci.yml/badge.svg)
+
 A ticket booking backend split into three Spring Boot microservices that talk to each other through RabbitMQ. I built it to learn how backend systems handle things like two users trying to book the same seat, messages being delivered more than once, and a service failing halfway through a request.
 
-Built with Java, Spring Boot, RabbitMQ, PostgreSQL and Docker.
+Built with Java, Spring Boot, RabbitMQ, PostgreSQL and Docker. Tested with JUnit 5, Mockito and Testcontainers.
 
 ## Why I built this
 
-Most of my earlier projects were single-service CRUD apps. I wanted to build something where services have to cooperate without calling each other directly, and where I had to think about what goes wrong, not just the happy path. This project made me learn asynchronous messaging, idempotent consumers, dead-letter queues and optimistic locking.
+Most of my earlier projects were single-service CRUD apps. I wanted to build something where services have to cooperate without calling each other directly, and where I had to think about what goes wrong, not just the happy path. This project made me learn asynchronous messaging, idempotent consumers, dead-letter queues, optimistic locking and how to test concurrent code.
 
 ## Architecture
 
@@ -28,7 +30,7 @@ Most of my earlier projects were single-service CRUD apps. I wanted to build som
                      │                       │
                      │  - seat status check  │
                      │  - @Version optimistic│
-                     │    locking            │
+                     │    locking + retries  │
                      │  - idempotency table  │
                      │  - dead-letter queue  │
                      └──────────┬───────────┘
@@ -59,13 +61,14 @@ The `bookingId` (a UUID) is created once in the Booking Service and travels thro
 
 ## Preventing double booking
 
-When a booking request reaches the Inventory Service, `SeatReservationService` looks up the seat. If the seat is not `AVAILABLE`, the request fails with `SEAT_ALREADY_BOOKED`. If it is available, it is set to `BOOKED` and saved.
+The reservation logic in the Inventory Service is split into two classes:
 
-The `Seat` entity also has a JPA `@Version` field. If two transactions load the same seat and both try to update it, only the first update succeeds and the second one fails with an `OptimisticLockingFailureException`. The service retries up to 3 times with fresh data. If the seat is no longer available, it fails cleanly with `SEAT_ALREADY_BOOKED`, and if it keeps conflicting it gives up with `SEAT_CONTENDED_TOO_MANY_RETRIES`.
+- **`SeatBooker.attemptReservation`** runs in a single database transaction. It loads the seat, and if it is `AVAILABLE` it sets it to `BOOKED`. It also saves a `ProcessedMessage` record with the outcome in the same transaction, so the seat update and the idempotency record are saved together or not at all. If the seat is missing or already booked, it records that failure instead.
+- **`SeatReservationService.reserveSeat`** first checks whether this `bookingId` was already processed and, if so, returns the stored outcome. Otherwise it calls `SeatBooker` inside a retry loop (up to 3 attempts). The loop lives outside the transaction so every retry starts with a fresh transaction and a fresh read of the seat.
 
-**What actually protects the seat in the default setup:** the Inventory listener runs with a single consumer, so RabbitMQ hands it one booking request at a time. That means requests for the same seat are handled one after another, and the status check is what rejects the later ones. The `@Version` check is an extra safety net for the case where several writers touch the same seat at once, for example if I ran multiple consumer threads or scaled the Inventory Service to more than one instance.
+The `Seat` entity has a JPA `@Version` field. If two transactions load the same seat and both try to update it, only the first commit succeeds and the second one fails with an `OptimisticLockingFailureException`. The service then retries, sees the seat is no longer available and fails cleanly with `SEAT_ALREADY_BOOKED`. If it keeps conflicting, it gives up with `SEAT_CONTENDED_TOO_MANY_RETRIES`.
 
-`SeatRepository` also has a pessimistic locking query (`SELECT ... FOR UPDATE`). It is there so I can compare the two approaches, but the reservation flow does not use it.
+**What protects the seat in the default setup:** the Inventory listener runs with a single consumer, so RabbitMQ hands it one booking request at a time and the status check rejects later requests for the same seat. `@Version` is what keeps the data correct if several writers touch the same seat at once, for example with multiple consumer threads or several Inventory instances. The concurrency test below exercises exactly that case.
 
 ## Other things this project covers
 
@@ -131,9 +134,32 @@ The status should change to `CONFIRMED` within a second or two. The mock confirm
 
 ## Testing
 
+There are 18 automated tests across the Booking and Inventory services. GitHub Actions runs them for every push and pull request (see the badge at the top).
+
+### Inventory Service (8 tests)
+
+- **`SeatBookerTest`** (Mockito): seat not found, seat already booked, and successful booking. It checks the seat is saved as `BOOKED` and the outcome is recorded.
+- **`SeatReservationServiceTest`** (Mockito): a duplicate `bookingId` returns the stored outcome without touching the seat, a lock conflict followed by success is retried, and three conflicts in a row end with `SEAT_CONTENDED_TOO_MANY_RETRIES`.
+- **`SeatReservationConcurrencyTest`** (Testcontainers with a real PostgreSQL): 20 threads are released at the same moment and all try to book the same seat. The test asserts that exactly one booking succeeds, the seat ends up `BOOKED`, and all 20 outcomes were recorded. It calls the service directly rather than going through RabbitMQ, because the queue would otherwise hand the requests over one at a time and the `@Version` check would never be exercised. I confirmed the test is meaningful by removing `@Version` from `Seat`: the test then fails.
+
+### Booking Service (10 tests)
+
+- **`BookingServiceTest`** (Mockito): a booking is saved as `PENDING` before the event is published, the event carries the same `bookingId`, and unknown bookings are rejected.
+- **`ReservationResultListenerTest`** (Mockito): success confirms the booking, failure records the reason, duplicate results for a finished booking are ignored, and results for unknown bookings are ignored.
+- **`BookingControllerTest`** (`@WebMvcTest`): a valid request returns 202, a missing field returns 400, and an unknown booking returns 404.
+
+### Running the tests
+
+```bash
+cd inventory-service && mvn test   # needs Docker running for the concurrency test
+cd booking-service && mvn test
+```
+
+If Testcontainers cannot find Docker on a very recent Docker Desktop, create a file named `.docker-java.properties` in your user home folder containing `api.version=1.44`.
+
 ### End-to-end check with several requests for one seat
 
-`concurrency-test.ps1` sends several booking requests for the same seat at almost the same time (as parallel background jobs), then checks each booking's final status and prints a summary.
+`concurrency-test.ps1` sends several booking requests for the same seat at almost the same time (as parallel background jobs) against the full running stack, then checks each booking's final status and prints a summary.
 
 ```powershell
 # Create an event with seats first (see step 1 above), then:
@@ -151,11 +177,7 @@ FAILED     -> bookingId=3f3f8c62-... userId=concurrent-user-5 reason=SEAT_ALREAD
 Summary: 1 CONFIRMED, 4 FAILED, 0 STILL PENDING (out of 5 requests for the same seat)
 ```
 
-This shows that, end to end, a seat is never sold twice when several clients request it together. It is a small check, not a stress test. Because the Inventory listener processes messages one at a time, the requests reach the seat one after another, so this script does not by itself exercise the `@Version` conflict path.
-
-### Automated tests
-
-I am adding automated tests next (see below). They are not in the project yet.
+This shows that, through the whole system including RabbitMQ, a seat is never sold twice when several clients request it together. Because the Inventory listener processes messages one at a time, it is a small end-to-end check and not a stress test of `@Version`. That is what the concurrency test above is for.
 
 ## Project structure
 
@@ -164,8 +186,9 @@ ticket-booking-system/
 ├── booking-service/       # Public REST API, orchestrates the flow
 ├── inventory-service/     # Owns seat state and the reservation logic
 ├── notification-service/  # Consumes the final status, sends (mock) notifications
+├── .github/workflows/     # CI: runs the tests on every push
 ├── docker-compose.yml     # Runs all of the above plus RabbitMQ and Postgres
-├── concurrency-test.ps1   # Several-requests-for-one-seat check
+├── concurrency-test.ps1   # End-to-end several-requests-for-one-seat check
 └── README.md
 ```
 
@@ -174,13 +197,12 @@ ticket-booking-system/
 - A booking is saved first and the message is published afterwards. If the Booking Service crashed between the two, the booking would stay `PENDING` forever. A transactional outbox would solve this.
 - There is no timeout for bookings that stay `PENDING`.
 - Only the booking-requested queue has a dead-letter queue.
-- The Notification Service is not idempotent.
+- The Notification Service is not idempotent and has no tests.
 - Clients have to poll for the booking status.
 - Database and RabbitMQ credentials in the config files are local development defaults.
 
-## What I plan to add next
+## Ideas for next steps
 
-- Unit tests (JUnit and Mockito) for the reservation and result-handling logic.
-- An integration test using Testcontainers and a real PostgreSQL that fires many threads at the same seat directly at the service layer, so the `@Version` conflict and retry path is exercised.
-- GitHub Actions to run the tests on every push.
-- Later, if time allows: a seat hold with an expiry, and metrics with Prometheus and Grafana.
+- A transactional outbox in the Booking Service to remove the save-then-publish gap.
+- Seat holds that expire after a timeout, with a scheduled job that fails stale `PENDING` bookings.
+- Metrics with Prometheus and Grafana.
