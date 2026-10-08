@@ -10,6 +10,9 @@ import java.io.Serializable;
 @NoArgsConstructor
 @AllArgsConstructor
 @Builder
+
+//While your previous BookingRequestedEvent asks the system to
+// start processing, the BookingStatusEvent announces the final outcome of that attempt
 public class BookingStatusEvent implements Serializable {
     private String bookingId;
     private String userId;

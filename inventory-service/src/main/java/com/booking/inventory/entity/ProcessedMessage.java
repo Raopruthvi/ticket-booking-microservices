@@ -17,10 +17,14 @@ import java.time.LocalDateTime;
 @NoArgsConstructor
 @AllArgsConstructor
 @Builder
-public class ProcessedMessage {
+public class ProcessedMessage {          //its whole purpose is to remember "have I already handled this exact booking before?
 
     @Id
     private String messageId; // the bookingId / idempotency key from the event
 
     private LocalDateTime processedAt;
+
+    private boolean success;  //tells that this has been handled and no need to check again.
+
+    private String reason;  //this is the audit log
 }

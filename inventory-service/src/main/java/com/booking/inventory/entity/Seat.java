@@ -44,7 +44,6 @@ public class Seat {
 
     public enum SeatStatus {
         AVAILABLE,
-        LOCKED,     // temporarily held while booking is in progress
         BOOKED
     }
 }

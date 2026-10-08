@@ -13,10 +13,10 @@ import org.springframework.web.bind.annotation.*;
 import java.time.LocalDateTime;
 import java.util.List;
 
-@RestController
+@RestController  //includes controller and response body
 @RequestMapping("/api/inventory")
 @RequiredArgsConstructor
-@Tag(name = "Inventory", description = "Seed events/seats and check live seat availability")
+@Tag(name = "Inventory", description = "Seed events/seats and check live seat availability")   //swagger/openAPI annotaion for documentation purpose
 public class InventoryController {
 
     private final EventRepository eventRepository;
@@ -24,7 +24,7 @@ public class InventoryController {
 
     public record CreateEventRequest(String name, String venue, int numberOfSeats) {}
 
-    @Operation(summary = "Create an event with N seats (S1, S2, ... SN), all starting AVAILABLE")
+    @Operation(summary = "Create an event with N seats (S1, S2, ... SN), all starting AVAILABLE") //swagger/openAI annotation
     @PostMapping("/events")
     public ResponseEntity<Event> createEvent(@RequestBody CreateEventRequest request) {
         Event event = Event.builder()
@@ -46,7 +46,7 @@ public class InventoryController {
         return ResponseEntity.ok(event);
     }
 
-    @Operation(summary = "List all seats for an event with their live status (AVAILABLE / LOCKED / BOOKED)")
+    @Operation(summary = "List all seats for an event with their live status (AVAILABLE / BOOKED)")
     @GetMapping("/events/{eventId}/seats")
     public ResponseEntity<List<Seat>> getSeats(@PathVariable Long eventId) {
         return ResponseEntity.ok(seatRepository.findByEventId(eventId));

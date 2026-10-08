@@ -1,18 +1,12 @@
 # Distributed Ticket Booking System
 
-A microservices-based ticket booking system built to explore real distributed-systems
-problems: **concurrency control** (preventing double-booking), **asynchronous
-communication** (RabbitMQ), and **idempotent, fault-tolerant event processing**.
+A ticket booking backend split into three Spring Boot microservices that talk to each other through RabbitMQ. I built it to learn how backend systems handle things like two users trying to book the same seat, messages being delivered more than once, and a service failing halfway through a request.
 
-Built with Java, Spring Boot, RabbitMQ, PostgreSQL, and Docker.
+Built with Java, Spring Boot, RabbitMQ, PostgreSQL and Docker.
 
-## Why this exists
+## Why I built this
 
-Most fresher/portfolio projects are single-service CRUD apps. This project instead
-tackles a genuinely hard problem: what happens when two users try to book the same
-seat at the exact same instant? The answer involves optimistic locking, retries,
-idempotent consumers, and dead-letter queues — concepts that come up constantly in
-backend interviews.
+Most of my earlier projects were single-service CRUD apps. I wanted to build something where services have to cooperate without calling each other directly, and where I had to think about what goes wrong, not just the happy path. This project made me learn asynchronous messaging, idempotent consumers, dead-letter queues and optimistic locking.
 
 ## Architecture
 
@@ -32,16 +26,16 @@ backend interviews.
                      │  Inventory Service    │  (port 8081)
                      │  Postgres: inventory  │
                      │                       │
-                     │  - optimistic locking │
-                     │    (@Version) to stop │
-                     │    double-booking     │
-                     │  - idempotent consumer│
+                     │  - seat status check  │
+                     │  - @Version optimistic│
+                     │    locking            │
+                     │  - idempotency table  │
                      │  - dead-letter queue  │
                      └──────────┬───────────┘
                                 │ publishes "seat.reservation.result"
                                 ▼
                      ┌─────────────────────┐
-                     │   Booking Service     │ (consumes result,
+                     │   Booking Service     │ (consumes the result,
                      │   (same service)      │  updates booking status)
                      └──────────┬───────────┘
                                 │ publishes "booking.status"
@@ -52,36 +46,35 @@ backend interviews.
                      └─────────────────────┘
 ```
 
-## The core problem this solves: double-booking
+### How a booking flows
 
-Two users hit "book" on seat `S5` of the same event at the same millisecond.
-Without protection, both requests could read "AVAILABLE" and both write "BOOKED" —
-selling the same seat twice.
+1. The client sends `POST /api/bookings` to the Booking Service.
+2. The Booking Service saves a booking with status `PENDING`, publishes a `BookingRequested` event and immediately returns `202 Accepted`. It does not wait for the seat to be reserved.
+3. The Inventory Service picks up the event, checks the seat and either books it or rejects the request.
+4. The Inventory Service publishes the result. The Booking Service consumes it and sets the booking to `CONFIRMED` or `FAILED` (with a reason).
+5. The Booking Service publishes a status event and the Notification Service logs a mock email.
+6. The client checks the final result with `GET /api/bookings/{id}`.
 
-**Solution: optimistic locking via JPA's `@Version`.**
-Every `Seat` row has a `version` column that Hibernate auto-increments on update.
-If two transactions read the same seat and both try to update it, only the first
-commit succeeds — the second gets an `OptimisticLockingFailureException` instead of
-silently overwriting. The `SeatReservationService` catches this and retries with
-fresh data, failing cleanly (`SEAT_ALREADY_BOOKED`) if the seat is genuinely gone.
+The `bookingId` (a UUID) is created once in the Booking Service and travels through every step. The consumers use it to recognise messages they have already handled.
 
-See `inventory-service/.../service/SeatReservationService.java` for the full logic,
-and `SeatRepository.java` for an alternative pessimistic-locking (`SELECT FOR
-UPDATE`) approach kept in for comparison.
+## Preventing double booking
 
-## Other things this project demonstrates
+When a booking request reaches the Inventory Service, `SeatReservationService` looks up the seat. If the seat is not `AVAILABLE`, the request fails with `SEAT_ALREADY_BOOKED`. If it is available, it is set to `BOOKED` and saved.
 
-- **Idempotent consumers** — RabbitMQ guarantees at-least-once delivery, not
-  exactly-once. Each service tracks processed message/booking IDs so a redelivered
-  message doesn't get double-processed.
-- **Dead-letter queues** — if the Inventory Service listener fails repeatedly
-  (e.g. DB outage), the message is routed to a DLQ instead of being lost or
-  retried forever.
-- **Service-per-database** — each service owns its own Postgres database; there's
-  no shared schema, so services can be deployed/scaled independently.
-- **Async orchestration without a central orchestrator** — services react to events
-  rather than being commanded step-by-step, which is closer to how this is done in
-  production systems than a simple synchronous REST-call chain.
+The `Seat` entity also has a JPA `@Version` field. If two transactions load the same seat and both try to update it, only the first update succeeds and the second one fails with an `OptimisticLockingFailureException`. The service retries up to 3 times with fresh data. If the seat is no longer available, it fails cleanly with `SEAT_ALREADY_BOOKED`, and if it keeps conflicting it gives up with `SEAT_CONTENDED_TOO_MANY_RETRIES`.
+
+**What actually protects the seat in the default setup:** the Inventory listener runs with a single consumer, so RabbitMQ hands it one booking request at a time. That means requests for the same seat are handled one after another, and the status check is what rejects the later ones. The `@Version` check is an extra safety net for the case where several writers touch the same seat at once, for example if I ran multiple consumer threads or scaled the Inventory Service to more than one instance.
+
+`SeatRepository` also has a pessimistic locking query (`SELECT ... FOR UPDATE`). It is there so I can compare the two approaches, but the reservation flow does not use it.
+
+## Other things this project covers
+
+- **Idempotent processing.** RabbitMQ guarantees at-least-once delivery, so the same message can arrive twice. The Inventory Service stores every processed `bookingId` together with its outcome in a `processed_messages` table and replays the stored result for duplicates. The Booking Service skips results for bookings that are no longer `PENDING`. (The Notification Service just logs, so a duplicate message would produce a duplicate log line.)
+- **Dead-letter queue.** If the Inventory listener keeps failing (for example if its database is down), it retries 3 times with exponential backoff (1s, then 2s). After that the message is rejected and the queue's dead-letter settings route it to `inventory.booking-requested.dlq` instead of losing it. This is configured for the booking-requested queue only.
+- **Database per service.** Booking and Inventory each have their own PostgreSQL database and no shared schema.
+- **Event-driven flow.** The services react to events instead of calling each other step by step over REST.
+- **Validation and error handling.** Request validation with Bean Validation and a global exception handler that returns proper 400 and 404 responses.
+- **API docs.** Swagger UI on the Booking and Inventory services.
 
 ## Running it
 
@@ -89,12 +82,11 @@ Requires Docker and Docker Compose.
 
 ```bash
 git clone <this-repo-url>
-cd ticket-booking-system
+cd <repo-folder>
 docker-compose up --build
 ```
 
-This starts: RabbitMQ (+ management UI), two Postgres instances, and all three
-services. Wait ~30-60 seconds for everything to become healthy.
+This starts RabbitMQ (with its management UI), two PostgreSQL databases and the three services. Give it 30 to 60 seconds to become healthy.
 
 - Booking Service: http://localhost:8080
 - Inventory Service: http://localhost:8081
@@ -109,7 +101,7 @@ curl -X POST http://localhost:8081/api/inventory/events \
   -H "Content-Type: application/json" \
   -d '{"name": "Coldplay Live", "venue": "City Arena", "numberOfSeats": 10}'
 ```
-Note the returned `id` — you'll need it as `eventId` below.
+Note the returned `id`. You need it as `eventId` below.
 
 **2. Check seat availability:**
 ```bash
@@ -122,62 +114,33 @@ curl -X POST http://localhost:8080/api/bookings \
   -H "Content-Type: application/json" \
   -d '{"eventId": 1, "seatNumber": "S1", "userId": "user-123"}'
 ```
-This returns immediately with status `PENDING` — the actual reservation happens
-asynchronously.
+This returns immediately with status `PENDING`. The reservation itself happens asynchronously.
 
-**4. Poll for the result:**
+**4. Check the result:**
 ```bash
 curl http://localhost:8080/api/bookings/<bookingId-from-step-3>
 ```
-Status should flip to `CONFIRMED` within a second or two. Check the
-notification-service logs (`docker logs notification-service`) to see the mock
-confirmation email.
+The status should change to `CONFIRMED` within a second or two. The mock confirmation email shows up in `docker logs notification-service`.
 
-**5. Try to double-book the same seat** (run step 3 again with the same
-`seatNumber`) — the second request will resolve to `FAILED` with reason
-`SEAT_ALREADY_BOOKED`.
+**5. Try to book the same seat again** (run step 3 again with the same `seatNumber`). The second booking ends as `FAILED` with reason `SEAT_ALREADY_BOOKED`.
 
 ## Interactive API docs (Swagger UI)
-
-Both Booking Service and Inventory Service expose a Swagger UI, so you can browse
-and try every endpoint from the browser instead of the command line:
 
 - Booking Service: http://localhost:8080/swagger-ui.html
 - Inventory Service: http://localhost:8081/swagger-ui.html
 
-## Proving the concurrency control with a real race condition
+## Testing
 
-`concurrency-test.ps1` fires several booking requests at the *same* seat
-essentially simultaneously (as background jobs, not one after another), then
-polls each one's final status and prints a summary. This is a repeatable way
-to demonstrate the optimistic locking under genuine concurrent load, not just
-a single sequential retry.
+### End-to-end check with several requests for one seat
+
+`concurrency-test.ps1` sends several booking requests for the same seat at almost the same time (as parallel background jobs), then checks each booking's final status and prints a summary.
 
 ```powershell
-# 1. Create an event with seats first (see step 1 above), then:
+# Create an event with seats first (see step 1 above), then:
 .\concurrency-test.ps1 -EventId 1 -SeatNumber "S1" -Requests 5
 ```
 
-Expected output: exactly 1 `CONFIRMED` and the rest `FAILED` with reason
-`SEAT_ALREADY_BOOKED` — no matter how many requests you fire at the same seat.
-
-## Verified
-
-This flow has been tested end-to-end against the running Docker Compose stack.
-
-**Happy path — booking a seat:**
-```bash
-curl -X POST http://localhost:8080/api/bookings -H "Content-Type: application/json" \
-  -d '{"eventId": 1, "seatNumber": "S1", "userId": "user-123"}'
-# → {"bookingId":"41ec11de-3659-44fb-95e4-e2f794b89670","status":"PENDING", ...}
-
-curl http://localhost:8080/api/bookings/41ec11de-3659-44fb-95e4-e2f794b89670
-# → {"status":"CONFIRMED", ...}
-```
-
-**Concurrency control — 5 simultaneous requests for the same seat:**
-Ran `concurrency-test.ps1` firing 5 truly concurrent booking requests at the
-same seat. Actual output:
+Output from one of my runs with 5 requests:
 ```
 CONFIRMED  -> bookingId=9f40870c-... userId=concurrent-user-1
 FAILED     -> bookingId=1801235a-... userId=concurrent-user-2 reason=SEAT_ALREADY_BOOKED
@@ -188,28 +151,36 @@ FAILED     -> bookingId=3f3f8c62-... userId=concurrent-user-5 reason=SEAT_ALREAD
 Summary: 1 CONFIRMED, 4 FAILED, 0 STILL PENDING (out of 5 requests for the same seat)
 ```
 
-No seat was double-booked, even under a genuine 5-way race, not just a single
-one-on-one collision. This confirms the `@Version`-based optimistic locking
-in `SeatReservationService` works as intended: when multiple transactions race to
-update the same seat row, only the first commit succeeds — every other
-transaction is rejected by Hibernate's version check, caught, and resolved into a clean
-failure response rather than corrupting data or silently overwriting the winner.
+This shows that, end to end, a seat is never sold twice when several clients request it together. It is a small check, not a stress test. Because the Inventory listener processes messages one at a time, the requests reach the seat one after another, so this script does not by itself exercise the `@Version` conflict path.
+
+### Automated tests
+
+I am adding automated tests next (see below). They are not in the project yet.
 
 ## Project structure
 
 ```
 ticket-booking-system/
 ├── booking-service/       # Public REST API, orchestrates the flow
-├── inventory-service/     # Owns seat state, concurrency control lives here
-├── notification-service/  # Consumes final status, sends (mock) notifications
-├── docker-compose.yml     # Orchestrates all of the above + RabbitMQ + Postgres
+├── inventory-service/     # Owns seat state and the reservation logic
+├── notification-service/  # Consumes the final status, sends (mock) notifications
+├── docker-compose.yml     # Runs all of the above plus RabbitMQ and Postgres
+├── concurrency-test.ps1   # Several-requests-for-one-seat check
 └── README.md
 ```
 
-## What I'd add with more time
+## Known limitations
 
-- Redis-based distributed lock as an alternative to DB-level optimistic locking
-- A seat "hold" step (temporary lock while user is on a payment page) with TTL expiry
-- WebSocket/SSE push instead of client polling for booking status
-- Centralized logging (ELK) and metrics (Prometheus/Grafana) across services
-- API Gateway (Spring Cloud Gateway) in front of Booking Service
+- A booking is saved first and the message is published afterwards. If the Booking Service crashed between the two, the booking would stay `PENDING` forever. A transactional outbox would solve this.
+- There is no timeout for bookings that stay `PENDING`.
+- Only the booking-requested queue has a dead-letter queue.
+- The Notification Service is not idempotent.
+- Clients have to poll for the booking status.
+- Database and RabbitMQ credentials in the config files are local development defaults.
+
+## What I plan to add next
+
+- Unit tests (JUnit and Mockito) for the reservation and result-handling logic.
+- An integration test using Testcontainers and a real PostgreSQL that fires many threads at the same seat directly at the service layer, so the `@Version` conflict and retry path is exercised.
+- GitHub Actions to run the tests on every push.
+- Later, if time allows: a seat hold with an expiry, and metrics with Prometheus and Grafana.
