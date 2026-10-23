@@ -4,7 +4,7 @@
 
 A ticket booking backend split into three Spring Boot microservices that talk to each other through RabbitMQ. I built it to learn how backend systems handle things like two users trying to book the same seat, messages being delivered more than once, and a service failing halfway through a request.
 
-Built with Java, Spring Boot, RabbitMQ, PostgreSQL and Docker. Tested with JUnit 5, Mockito and Testcontainers.
+Built with Java 17, Spring Boot, RabbitMQ, PostgreSQL and Docker. Tested with JUnit 5, Mockito and Testcontainers.
 
 ## Why I built this
 
@@ -64,7 +64,7 @@ The `bookingId` (a UUID) is created once in the Booking Service and travels thro
 The reservation logic in the Inventory Service is split into two classes:
 
 - **`SeatBooker.attemptReservation`** runs in a single database transaction. It loads the seat, and if it is `AVAILABLE` it sets it to `BOOKED`. It also saves a `ProcessedMessage` record with the outcome in the same transaction, so the seat update and the idempotency record are saved together or not at all. If the seat is missing or already booked, it records that failure instead.
-- **`SeatReservationService.reserveSeat`** first checks whether this `bookingId` was already processed and, if so, returns the stored outcome. Otherwise it calls `SeatBooker` inside a retry loop (up to 3 attempts). The loop lives outside the transaction so every retry starts with a fresh transaction and a fresh read of the seat.
+- **`SeatReservationService.reserveSeat`** first checks whether this `bookingId` was already processed and, if so, returns the stored outcome. Otherwise it calls `SeatBooker` inside a retry loop (up to 3 attempts). The loop lives outside the transaction so every retry starts with a fresh transaction and a fresh read of the seat. (It has to be a separate class: Spring applies `@Transactional` through a proxy, and a method that calls another method in its own class bypasses that proxy.)
 
 The `Seat` entity has a JPA `@Version` field. If two transactions load the same seat and both try to update it, only the first commit succeeds and the second one fails with an `OptimisticLockingFailureException`. The service then retries, sees the seat is no longer available and fails cleanly with `SEAT_ALREADY_BOOKED`. If it keeps conflicting, it gives up with `SEAT_CONTENDED_TOO_MANY_RETRIES`.
 
@@ -73,7 +73,7 @@ The `Seat` entity has a JPA `@Version` field. If two transactions load the same 
 ## Other things this project covers
 
 - **Idempotent processing.** RabbitMQ guarantees at-least-once delivery, so the same message can arrive twice. The Inventory Service stores every processed `bookingId` together with its outcome in a `processed_messages` table and replays the stored result for duplicates. The Booking Service skips results for bookings that are no longer `PENDING`. (The Notification Service just logs, so a duplicate message would produce a duplicate log line.)
-- **Dead-letter queue.** If the Inventory listener keeps failing (for example if its database is down), it retries 3 times with exponential backoff (1s, then 2s). After that the message is rejected and the queue's dead-letter settings route it to `inventory.booking-requested.dlq` instead of losing it. This is configured for the booking-requested queue only.
+- **Dead-letter queue.** If the Inventory listener keeps failing (for example if its database is down), it makes 3 attempts in total, waiting 1 second and then 2 seconds between them. After that the message is rejected and the queue's dead-letter settings route it to `inventory.booking-requested.dlq` instead of losing it. This applies to thrown exceptions, not to business failures such as `SEAT_ALREADY_BOOKED`. It is configured for the booking-requested queue only.
 - **Database per service.** Booking and Inventory each have their own PostgreSQL database and no shared schema.
 - **Event-driven flow.** The services react to events instead of calling each other step by step over REST.
 - **Validation and error handling.** Request validation with Bean Validation and a global exception handler that returns proper 400 and 404 responses.
@@ -81,12 +81,12 @@ The `Seat` entity has a JPA `@Version` field. If two transactions load the same 
 
 ## Running it
 
-Requires Docker and Docker Compose.
+Requires Docker with Docker Compose v2.
 
 ```bash
-git clone <this-repo-url>
-cd <repo-folder>
-docker-compose up --build
+git clone https://github.com/Raopruthvi/ticket-booking-microservices.git
+cd ticket-booking-microservices
+docker compose up --build
 ```
 
 This starts RabbitMQ (with its management UI), two PostgreSQL databases and the three services. Give it 30 to 60 seconds to become healthy.
@@ -138,15 +138,15 @@ There are 18 automated tests across the Booking and Inventory services. GitHub A
 
 ### Inventory Service (8 tests)
 
-- **`SeatBookerTest`** (Mockito): seat not found, seat already booked, and successful booking. It checks the seat is saved as `BOOKED` and the outcome is recorded.
-- **`SeatReservationServiceTest`** (Mockito): a duplicate `bookingId` returns the stored outcome without touching the seat, a lock conflict followed by success is retried, and three conflicts in a row end with `SEAT_CONTENDED_TOO_MANY_RETRIES`.
-- **`SeatReservationConcurrencyTest`** (Testcontainers with a real PostgreSQL): 20 threads are released at the same moment and all try to book the same seat. The test asserts that exactly one booking succeeds, the seat ends up `BOOKED`, and all 20 outcomes were recorded. It calls the service directly rather than going through RabbitMQ, because the queue would otherwise hand the requests over one at a time and the `@Version` check would never be exercised. I confirmed the test is meaningful by removing `@Version` from `Seat`: the test then fails.
+- **`SeatBookerTest`** (Mockito, 3 tests): seat not found, seat already booked, and successful booking. It checks the seat is saved as `BOOKED` and the outcome is recorded.
+- **`SeatReservationServiceTest`** (Mockito, 4 tests): a duplicate `bookingId` with a stored success returns success without touching the seat, a duplicate with a stored failure returns the same reason, one lock conflict followed by success is retried, and three conflicts in a row end with `SEAT_CONTENDED_TOO_MANY_RETRIES`.
+- **`SeatReservationConcurrencyTest`** (Testcontainers with a real PostgreSQL, 1 test): 20 threads are released at the same moment and all try to book the same seat. The test asserts that exactly one booking succeeds, the seat ends up `BOOKED`, and all 20 outcomes were recorded. It calls the service directly rather than going through RabbitMQ, because the queue would otherwise hand the requests over one at a time and the `@Version` check would never be exercised. I confirmed the test is meaningful by removing `@Version` from `Seat`: the test then fails.
 
 ### Booking Service (10 tests)
 
-- **`BookingServiceTest`** (Mockito): a booking is saved as `PENDING` before the event is published, the event carries the same `bookingId`, and unknown bookings are rejected.
-- **`ReservationResultListenerTest`** (Mockito): success confirms the booking, failure records the reason, duplicate results for a finished booking are ignored, and results for unknown bookings are ignored.
-- **`BookingControllerTest`** (`@WebMvcTest`): a valid request returns 202, a missing field returns 400, and an unknown booking returns 404.
+- **`BookingServiceTest`** (Mockito, 3 tests): a booking is saved as `PENDING` before the event is published and the event carries the same `bookingId`; an existing booking is returned; an unknown booking is rejected.
+- **`ReservationResultListenerTest`** (Mockito, 4 tests): success confirms the booking and publishes a status event, failure records the reason, a duplicate result for a finished booking is ignored, and a result for an unknown booking is ignored.
+- **`BookingControllerTest`** (`@WebMvcTest`, 3 tests): a valid request returns 202, a missing field returns 400, and an unknown booking returns 404.
 
 ### Running the tests
 
@@ -163,7 +163,7 @@ If Testcontainers cannot find Docker on a very recent Docker Desktop, create a f
 
 ```powershell
 # Create an event with seats first (see step 1 above), then:
-.\concurrency-test.ps1 -EventId 1 -SeatNumber "S1" -Requests 5
+powershell -ExecutionPolicy Bypass -File .\concurrency-test.ps1 -EventId 1 -SeatNumber "S1" -Requests 5
 ```
 
 Output from one of my runs with 5 requests:
@@ -182,7 +182,7 @@ This shows that, through the whole system including RabbitMQ, a seat is never so
 ## Project structure
 
 ```
-ticket-booking-system/
+ticket-booking-microservices/
 ├── booking-service/       # Public REST API, orchestrates the flow
 ├── inventory-service/     # Owns seat state and the reservation logic
 ├── notification-service/  # Consumes the final status, sends (mock) notifications
@@ -194,8 +194,9 @@ ticket-booking-system/
 
 ## Known limitations
 
-- A booking is saved first and the message is published afterwards. If the Booking Service crashed between the two, the booking would stay `PENDING` forever. A transactional outbox would solve this.
+- **Save-then-publish gaps.** The Booking Service saves a booking and then publishes the message. If it crashed between the two, the booking would stay `PENDING` forever. The same pattern exists when a result arrives: the status is saved first and the status event is published afterwards. If the publish fails, the retry sees a booking that is no longer `PENDING`, skips it, and the notification is never sent. A transactional outbox would fix both.
 - There is no timeout for bookings that stay `PENDING`.
+- There is no authentication or authorization on any endpoint.
 - Only the booking-requested queue has a dead-letter queue.
 - The Notification Service is not idempotent and has no tests.
 - Clients have to poll for the booking status.
@@ -203,6 +204,7 @@ ticket-booking-system/
 
 ## Ideas for next steps
 
-- A transactional outbox in the Booking Service to remove the save-then-publish gap.
+- A transactional outbox in the Booking Service to remove the save-then-publish gaps.
 - Seat holds that expire after a timeout, with a scheduled job that fails stale `PENDING` bookings.
+- Basic authentication (for example JWT) on the Booking Service.
 - Metrics with Prometheus and Grafana.
